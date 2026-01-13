@@ -220,7 +220,8 @@ func (mg *MessageHub) readFrame(ctx context.Context, conn io.Reader, frameChan c
 }
 
 func (mg *MessageHub) processFrame(ctx context.Context, conn net.Conn, frameChan chan *frame, outChan chan *frame) {
-	fragmentations := make([]*frame, 0)
+	fragmentations := make([]byte, 0)
+	var rootFrame *frame
 	for true {
 		f := <-frameChan
 
@@ -238,8 +239,22 @@ func (mg *MessageHub) processFrame(ctx context.Context, conn net.Conn, frameChan
 				fin:     true,
 				payload: payload,
 			}
-			fragmentations = make([]*frame, 0)
-			continue
+			break
+		}
+
+		if rootFrame != nil && f.opCode != OP_CODE_CONTINUATION {
+			code := CLOSE_CODE_PROTOCOL_VIOLATION
+			highByte := byte(code >> 8)
+			lowByte := byte(code)
+			payload := []byte{highByte, lowByte}
+
+			// select
+			outChan <- &frame{
+				opCode:  OP_CODE_CLOSE,
+				fin:     true,
+				payload: payload,
+			}
+			break
 		}
 
 		// handle special op code
@@ -265,7 +280,43 @@ func (mg *MessageHub) processFrame(ctx context.Context, conn net.Conn, frameChan
 			break
 		}
 
-		// handle fragmentation
+		if !f.fin {
+			if rootFrame == nil && f.opCode != OP_CODE_BINARY && f.opCode != OP_CODE_TEXT {
+				code := CLOSE_CODE_PROTOCOL_VIOLATION
+				highByte := byte(code >> 8)
+				lowByte := byte(code)
+				payload := []byte{highByte, lowByte}
+
+				// select
+				outChan <- &frame{
+					opCode:  OP_CODE_CLOSE,
+					fin:     true,
+					payload: payload,
+				}
+				break
+			}
+			if rootFrame != nil {
+				rootFrame = f
+			}
+
+			fragmentations = append(fragmentations, f.payload...)
+			continue
+		}
+
+		finalPayload := append(fragmentations, f.payload...)
+
+		outFrame := &frame{
+			payload: finalPayload,
+		}
+		if rootFrame != nil {
+			outFrame.opCode = rootFrame.opCode
+		} else {
+			outFrame.opCode = f.opCode
+		}
+
+		outChan <- outFrame
+		rootFrame = nil
+		fragmentations = make([]byte, 0)
 	}
 }
 
