@@ -2,6 +2,7 @@ package logger
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -33,4 +34,10 @@ func GetWithValue(ctx context.Context) (context.Context, *slog.Logger) {
 		return context.WithValue(ctx, TRACE_ID_KEY, id), slog.With(TRACE_ID_KEY, id)
 	}
 	return ctx, slog.With(TRACE_ID_KEY, id)
+}
+
+func GetPPByteStr(b byte) string {
+	s := fmt.Sprint("%08b", b)
+	// Group as "xxxx xxxx"
+	return fmt.Sprintf("0x%02X %s %s", b, s[:4], s[4:])
 }
