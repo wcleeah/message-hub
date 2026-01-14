@@ -1,6 +1,7 @@
 ## Websocket processing
-- [ ] response
-- [ ] fragmentation handling
+- [x] response
+- [x] fragmentation handling
+- [ ] python script to interactively tests websocket
 
 ## Message hub
 - [ ] refactor / decouple web socket logic from the message hub

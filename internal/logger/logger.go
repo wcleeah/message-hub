@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -37,7 +38,20 @@ func GetWithValue(ctx context.Context) (context.Context, *slog.Logger) {
 }
 
 func GetPPByteStr(b byte) string {
-	s := fmt.Sprint("%08b", b)
+	s := fmt.Sprintf("%08b", b)
 	// Group as "xxxx xxxx"
 	return fmt.Sprintf("0x%02X %s %s", b, s[:4], s[4:])
+}
+
+func GetPPBytesStr(bs []byte) string {
+	var sb strings.Builder
+	for i, b := range bs {
+		fmt.Fprintf(&sb, "%s", GetPPByteStr(b))
+		if i != len(bs)-1 {
+			sb.WriteString(" | ")
+		}
+	}
+
+	return sb.String()
+
 }

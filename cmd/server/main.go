@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -17,9 +18,11 @@ func main() {
 	logger.Setup(slog.LevelDebug)
 	mux := http.NewServeMux()
 	mh := messagehub.NewMessageHug()
+	go mh.Start()
 
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
 		connCtx, l := logger.GetWithValue(r.Context())
+		l.Debug("Got something...")
 
 		connectionHeader := r.Header.Get("Connection")
 		if !strings.Contains(strings.ToLower(connectionHeader), "upgrade") {
@@ -117,7 +120,7 @@ func main() {
 		}
 		l.Debug("Passing control to message hub")
 
-		regMsg := messagehub.RegMessage{
+		regMsg := &messagehub.RegMessage{
 			Ctx:  connCtx,
 			Conn: conn,
 		}
@@ -125,6 +128,7 @@ func main() {
 		mh.RegChan() <- regMsg
 	})
 
+	fmt.Print("server starting...\n")
 	err := http.ListenAndServe(":42069", mux)
 
 	panic(err)
