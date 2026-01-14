@@ -7,4 +7,5 @@
 - [ ] refactor / decouple web socket logic from the message hub
 - [ ] register conn, keep track of liveliness, and the type of connection
 - [ ] construct the websocket protocol, with type and action
+- [ ] context cancelling (graceful shutdown for a connection)
 - [ ] allow subscription on events
