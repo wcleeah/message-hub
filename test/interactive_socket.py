@@ -1,5 +1,4 @@
 import asyncio
-import copy
 
 from wsproto import ConnectionType, WSConnection
 from wsproto.events import (
@@ -40,7 +39,11 @@ async def connect():
 
 
 async def writer_task(
-        ws: WSConnection, writer: asyncio.StreamWriter, outq: asyncio.Queue[Event | None], inq: asyncio.Queue[None], stdq: asyncio.Queue[None]
+    ws: WSConnection,
+    writer: asyncio.StreamWriter,
+    outq: asyncio.Queue[Event | None],
+    inq: asyncio.Queue[None],
+    stdq: asyncio.Queue[None],
 ):
     while True:
         event = await outq.get()
@@ -56,6 +59,10 @@ async def writer_task(
 
         await writer.drain()
         print("Writer: Sent event")
+        if isinstance(event, TextMessage) and not event.message_finished:
+            print("Writer: Fragmented, keep consuming event...")
+            continue
+
         if isinstance(event, Pong):
             print("Writer: PONG")
             await stdq.put(None)
@@ -65,10 +72,14 @@ async def writer_task(
 
 
 async def reader_task(
-        ws: WSConnection, reader: asyncio.StreamReader, outq: asyncio.Queue[Event | None], inq: asyncio.Queue[None], stdq: asyncio.Queue[None]
+    ws: WSConnection,
+    reader: asyncio.StreamReader,
+    outq: asyncio.Queue[Event | None],
+    inq: asyncio.Queue[None],
+    stdq: asyncio.Queue[None],
 ):
-    text_frag_payload: list[str] = []
-    bin_frag_payload: bytearray = bytearray()
+    text_frag_payload: str = ""
+    message_finished: bool = True
 
     try:
         while True:
@@ -76,26 +87,43 @@ async def reader_task(
             await inq.get()
             while True:
                 data = await reader.read(4096)
-                payload_bytes = copy.copy(data)
                 ws.receive_data(data)
-    
+
                 for event in ws.events():
+                    if isinstance(event, TextMessage):
+                        print(
+                            f"Reader: Text message received, frame payload: {event.data}"
+                        )
+                        text_frag_payload += event.data
+                        message_finished = False
+
+                        if event.message_finished:
+                            print(
+                                f"Reader: all frame received, full frame payload: {text_frag_payload}"
+                            )
+                            text_frag_payload = ""
+                            message_finished = True
+                            continue
+
                     if isinstance(event, Ping):
                         print(
                             f"Reader: Ping received, with payload {event.payload.decode()}, responsing a pong..."
                         )
                         await outq.put(Pong(payload=event.payload))
-                        print(
-                            f"Reader: Pong initiated with the same payload"
-                        )
+                        print("Reader: Pong initiated with the same payload")
                     if isinstance(event, Pong):
-                        print(f"Reader: Pong received, with payload {event.payload.decode()}")
+                        print(
+                            f"Reader: Pong received, with payload {event.payload.decode()}"
+                        )
                     if isinstance(event, CloseConnection):
-                        print(f"Reader: Close received, shutting down")
+                        print("Reader: Close received, shutting down")
                         return
 
-                await stdq.put(None)
-                break
+                if message_finished:
+                    await stdq.put(None)
+                else:
+                    continue
+
     except asyncio.CancelledError:
         print("Reader: mission accomplished, shutting down")
         return
@@ -108,12 +136,14 @@ async def stdin_task(outq: asyncio.Queue[Event | None], stdq: asyncio.Queue[None
     try:
         while True:
             print("Type command in the following format: <command>:<optional_payload>")
-            print("Avaliable command: quit, ping, pong")
+            print("Avaliable command: quit, ping, pong, text, frag")
             line = await asyncio.to_thread(input, ">> ")
             line = line.strip()
             match line.partition(":"):
                 case ("quit", _, payload):
-                    print(f"Stdin: User is a quitter, closing the connection with payload {payload}...")
+                    print(
+                        f"Stdin: User is a quitter, closing the connection with payload {payload}..."
+                    )
                     await outq.put(CloseConnection(code=1000, reason=payload))
                     return
                 case ("ping", _, payload):
@@ -122,6 +152,27 @@ async def stdin_task(outq: asyncio.Queue[Event | None], stdq: asyncio.Queue[None
                 case ("pong", _, payload):
                     print("Stdin: PONG")
                     await outq.put(Pong(payload=payload.encode()))
+                case ("text", _, payload):
+                    print("Stdin: sending meaningful message to server...", payload)
+                    await outq.put(TextMessage(data=payload))
+                case ("frag", _, payload):
+                    print(
+                        "Stdin: sending meaningful, but fragmented message to server...",
+                        payload,
+                    )
+                    if len(payload) < 2:
+                        print("Stdin: you have to give me more so i can fragment them")
+
+                    for i, ch in enumerate(payload):
+                        print(
+                            f"Stdin: fragmented frame {i}, with payload {ch}",
+                        )
+                        await outq.put(
+                            TextMessage(
+                                data=ch, message_finished=(i == len(payload) - 1)
+                            )
+                        )
+
                 case _:
                     print("Stdin: Invalid command, i expect better from you")
 
@@ -150,9 +201,7 @@ async def main():
     stdint = asyncio.create_task(stdin_task(outq, stdq))
     print("all tasks is up... wating patiently now...")
 
-    _done, pending = await asyncio.wait(
-        {rt, stdint}, return_when=asyncio.ALL_COMPLETED
-    )
+    _done, pending = await asyncio.wait({rt, stdint}, return_when=asyncio.ALL_COMPLETED)
 
     for t in pending:
         _ = t.cancel()

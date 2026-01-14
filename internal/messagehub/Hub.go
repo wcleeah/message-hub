@@ -319,7 +319,7 @@ func (mg *MessageHub) processFrame(ctx context.Context, conn net.Conn, frameChan
 				}
 				break
 			}
-			if rootFrame != nil {
+			if rootFrame == nil {
 				l.Debug("Frame Processor: this is the first fragmented frame", "opCode", f.opCode)
 				rootFrame = f
 			}
