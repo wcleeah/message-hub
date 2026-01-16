@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"com.lwc.message_center_server/internal/logger"
 	"com.lwc.message_center_server/internal/messagehub"
+	"github.com/google/uuid"
 )
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -17,11 +19,13 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 func main() {
 	logger.Setup(slog.LevelDebug)
 	mux := http.NewServeMux()
-	mh := messagehub.NewMessageHug()
-	go mh.Start()
+	mh := messagehub.NewMessageHub()
+
+	// ignoring error for now
+	mh.Start()
 
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
-		connCtx, l := logger.GetWithValue(r.Context())
+		connCtx, l := logger.GetWithValue(context.Background())
 		l.Debug("Got something...")
 
 		connectionHeader := r.Header.Get("Connection")
@@ -120,9 +124,10 @@ func main() {
 		}
 		l.Debug("Passing control to message hub")
 
-		regMsg := &messagehub.RegMessage{
+		regMsg := &messagehub.Client{
 			Ctx:  connCtx,
 			Conn: conn,
+			Id: uuid.New(),
 		}
 
 		mh.RegChan() <- regMsg

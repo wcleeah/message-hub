@@ -1,4 +1,5 @@
 import asyncio
+from asyncio.queues import QueueShutDown
 
 from wsproto import ConnectionType, WSConnection
 from wsproto.events import (
@@ -41,41 +42,39 @@ async def connect():
 async def writer_task(
     ws: WSConnection,
     writer: asyncio.StreamWriter,
-    outq: asyncio.Queue[Event | None],
-    inq: asyncio.Queue[None],
+    outq: asyncio.Queue[Event],
     stdq: asyncio.Queue[None],
 ):
-    while True:
-        event = await outq.get()
+    try:
+        while True:
+            event = await outq.get()
 
-        if event == None:
-            print("Writer: mission accomplished, shutting down")
-            return
+            print("Writer: Got an event")
 
-        print("Writer: Got an event")
+            data = ws.send(event)
+            writer.write(data)
 
-        data = ws.send(event)
-        writer.write(data)
+            await writer.drain()
+            print("Writer: Sent event")
 
-        await writer.drain()
-        print("Writer: Sent event")
-        if isinstance(event, TextMessage) and not event.message_finished:
-            print("Writer: Fragmented, keep consuming event...")
-            continue
+            if isinstance(event, Pong):
+                print("Writer: PONG")
+                await stdq.put(None)
 
-        if isinstance(event, Pong):
-            print("Writer: PONG")
-            await stdq.put(None)
-            continue
+            if isinstance(event, CloseConnection):
+                print("Writer: mission accomplished, shutting down")
+                return
 
-        await inq.put(None)
+    except QueueShutDown:
+        print("Writer: mission accomplished, shutting down")
+    except Exception as err:
+        print(f"Writer: unknown error: {err!r}, shutting down")
 
 
 async def reader_task(
     ws: WSConnection,
     reader: asyncio.StreamReader,
-    outq: asyncio.Queue[Event | None],
-    inq: asyncio.Queue[None],
+    outq: asyncio.Queue[Event],
     stdq: asyncio.Queue[None],
 ):
     text_frag_payload: str = ""
@@ -83,46 +82,39 @@ async def reader_task(
 
     try:
         while True:
-            # need to handle multiple read
-            await inq.get()
-            while True:
-                data = await reader.read(4096)
-                ws.receive_data(data)
+            data = await reader.read(4096)
+            ws.receive_data(data)
 
-                for event in ws.events():
-                    if isinstance(event, TextMessage):
+            for event in ws.events():
+                if isinstance(event, TextMessage):
+                    print(f"Reader: Text message received, frame payload: {event.data}")
+                    text_frag_payload += event.data
+                    message_finished = False
+
+                    if event.message_finished:
                         print(
-                            f"Reader: Text message received, frame payload: {event.data}"
+                            f"Reader: all frame received, full frame payload: {text_frag_payload}"
                         )
-                        text_frag_payload += event.data
-                        message_finished = False
+                        text_frag_payload = ""
+                        message_finished = True
+                        continue
 
-                        if event.message_finished:
-                            print(
-                                f"Reader: all frame received, full frame payload: {text_frag_payload}"
-                            )
-                            text_frag_payload = ""
-                            message_finished = True
-                            continue
+                if isinstance(event, Ping):
+                    await outq.put(Pong(payload=event.payload))
 
-                    if isinstance(event, Ping):
-                        print(
-                            f"Reader: Ping received, with payload {event.payload.decode()}, responsing a pong..."
-                        )
-                        await outq.put(Pong(payload=event.payload))
-                        print("Reader: Pong initiated with the same payload")
-                    if isinstance(event, Pong):
-                        print(
-                            f"Reader: Pong received, with payload {event.payload.decode()}"
-                        )
-                    if isinstance(event, CloseConnection):
-                        print("Reader: Close received, shutting down")
-                        return
+                if isinstance(event, Pong):
+                    print(
+                        f"Reader: Pong received, with payload {event.payload.decode()}"
+                    )
 
-                if message_finished:
-                    await stdq.put(None)
-                else:
-                    continue
+                if isinstance(event, CloseConnection):
+                    print("Reader: Close received, shutting down")
+                    return
+
+            if message_finished:
+                await stdq.put(None)
+            else:
+                continue
 
     except asyncio.CancelledError:
         print("Reader: mission accomplished, shutting down")
@@ -132,11 +124,11 @@ async def reader_task(
         return
 
 
-async def stdin_task(outq: asyncio.Queue[Event | None], stdq: asyncio.Queue[None]):
+async def stdin_task(outq: asyncio.Queue[Event], stdq: asyncio.Queue[None]):
     try:
         while True:
             print("Type command in the following format: <command>:<optional_payload>")
-            print("Avaliable command: quit, ping, pong, text, frag")
+            print("Avaliable command: quit, fq, ping, pong, text, frag")
             line = await asyncio.to_thread(input, ">> ")
             line = line.strip()
             match line.partition(":"):
@@ -172,6 +164,9 @@ async def stdin_task(outq: asyncio.Queue[Event | None], stdq: asyncio.Queue[None
                                 data=ch, message_finished=(i == len(payload) - 1)
                             )
                         )
+                case ("fq", _, _):
+                    print("Stdin: user forced me to quit, will do so you loser")
+                    break
 
                 case _:
                     print("Stdin: Invalid command, i expect better from you")
@@ -180,7 +175,7 @@ async def stdin_task(outq: asyncio.Queue[Event | None], stdq: asyncio.Queue[None
             # This util aims to test one event at a time, so it is fine
             await stdq.get()
 
-    except asyncio.CancelledError:
+    except asyncio.CancelledError or asyncio.QueueShutDown:
         print("Stdin: mission accomplished, shutting down")
         return
     except Exception as e:
@@ -190,23 +185,37 @@ async def stdin_task(outq: asyncio.Queue[Event | None], stdq: asyncio.Queue[None
 
 async def main():
     print("setting up...")
-    outq = asyncio.Queue[Event | None]()
-    inq = asyncio.Queue[None]()
+    outq = asyncio.Queue[Event]()
     stdq = asyncio.Queue[None]()
-    ws, reader, writer = await connect()
-    print("i think we are in...")
 
-    wt = asyncio.create_task(writer_task(ws, writer, outq, inq, stdq))
-    rt = asyncio.create_task(reader_task(ws, reader, outq, inq, stdq))
+    # i hate python scoping
+    try:
+        ws, reader, writer = await connect()
+        print("i think we are in...")
+    except ConnectionError:
+        print("we are not in...")
+        return
+    except Exception as err:
+        print(f"Unexpected error while connecting: {err!r}")
+        return
+
+    wt = asyncio.create_task(writer_task(ws, writer, outq, stdq))
+    rt = asyncio.create_task(reader_task(ws, reader, outq, stdq))
     stdint = asyncio.create_task(stdin_task(outq, stdq))
     print("all tasks is up... wating patiently now...")
 
-    _done, pending = await asyncio.wait({rt, stdint}, return_when=asyncio.ALL_COMPLETED)
+    _done, pending = await asyncio.wait(
+        {rt, stdint}, return_when=asyncio.FIRST_COMPLETED
+    )
 
     for t in pending:
         _ = t.cancel()
 
-    await outq.put(None)
+    # allow for queued already event to go through
+    outq.shutdown()
+
+    # stop all pending stdin chances
+    stdq.shutdown(immediate=True)
     await wt
 
     writer.close()
