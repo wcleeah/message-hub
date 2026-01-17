@@ -96,9 +96,8 @@ func (ws *WebSocket) Setup() {
 	go ws.send()
 	go ws.read()
 
-	pingPongDisabled := os.Getenv("WEB_SOCKET_DISABLE_PING_PONG")
 	ws.conn.SetReadDeadline(time.Now().Add(ws.allowedIdleTime))
-	if pingPongDisabled != "true" {
+	if ws.pingInterval > 0 {
 		go ws.ping()
 	}
 

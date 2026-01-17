@@ -22,7 +22,7 @@ type frameErr struct {
 }
 
 func (pv frameErr) Error() string {
-	return fmt.Sprintf("%s: %s", pv.CloseCode, pv.Message)
+	return fmt.Sprintf("%d: %s", pv.CloseCode, pv.Message)
 }
 
 func (pv frameErr) ToPayload() []byte {

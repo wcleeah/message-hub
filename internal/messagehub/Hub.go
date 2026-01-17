@@ -3,6 +3,7 @@ package messagehub
 import (
 	"context"
 	"net"
+	"os"
 	"time"
 
 	"com.lwc.message_center_server/internal/assert"
@@ -12,22 +13,28 @@ import (
 )
 
 type Client struct {
-	Ctx        context.Context
-	Conn       net.Conn
-	Id         uuid.UUID
+	Ctx  context.Context
+	Conn net.Conn
+	Id   uuid.UUID
 }
 
 type MessageHub struct {
-	regChan   chan *Client
-	unregChan chan uuid.UUID
-	clients   map[uuid.UUID]*Client
+	regChan                 chan *Client
+	unregChan               chan uuid.UUID
+	clients                 map[uuid.UUID]*Client
+	livelinessCheckInterval time.Duration
 }
 
 func NewMessageHub() *MessageHub {
+	livelinessCheckInterval := 5 * time.Second
+	if disabledPingPong := os.Getenv("WEB_SOCKET_DISABLE_PING_PONG"); disabledPingPong == "true" {
+		livelinessCheckInterval = 0 * time.Second
+	}
 	return &MessageHub{
-		regChan:   make(chan *Client, 10),
-		unregChan: make(chan uuid.UUID, 10),
-		clients: make(map[uuid.UUID]*Client),
+		regChan:                 make(chan *Client, 10),
+		unregChan:               make(chan uuid.UUID, 10),
+		clients:                 make(map[uuid.UUID]*Client),
+		livelinessCheckInterval: livelinessCheckInterval,
 	}
 }
 
@@ -62,7 +69,7 @@ func (mh *MessageHub) unregisterClient() {
 
 func (mh *MessageHub) handleEvent(c *Client) {
 	l := logger.Get(c.Ctx)
-	ws := websocket.NewWebSocket(c.Ctx, c.Conn, 30*time.Second, 5*time.Second)
+	ws := websocket.NewWebSocket(c.Ctx, c.Conn, 30*time.Second, mh.livelinessCheckInterval)
 	ws.Setup()
 
 	for true {
