@@ -7,7 +7,20 @@
 - [x] refactor / decouple web socket logic from the message hub
 - [x] register conn, keep track of liveliness, and the type of connection
 - [x] context cancelling (graceful shutdown for a connection)
-- [ ] integrate with message hub
+- [x] integrate with message hub
+
+## Testing
+- [ ] Closing logic / scenarios
+  - [ ] cancel ctx
+  - [ ] conn close during read
+  - [ ] conn close during send
+  - [ ] read deadline exceeds
+  - [ ] write deadline exceeds
+- [ ] protocol violation
+- [ ] Setup
+- [ ] Auto ping pong
+- [ ] Text frame / frag frame read
+- [ ] Text frame / frag frame read 
 
 ## The event handling part
 - [ ] construct the websocket protocol, with type and action
