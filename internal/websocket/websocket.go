@@ -9,7 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,33 +53,46 @@ func (tf TextFrame) GetPayload() []byte {
 	return tf.Payload
 }
 
+type closeFrame struct {
+	Payload []byte
+}
+
+func (tf closeFrame) GetOpCode() byte {
+	return OP_CODE_CLOSE
+}
+
+func (tf closeFrame) GetPayload() []byte {
+	return tf.Payload
+}
+
 // Some notes on error handling / close handling, applied to who do the logging as well
 // - If the error is connection level, like closed connection immediate return, call cancelFunc, populate the cancel signal
 // - If the error is protocol level, like invalid frame, internal error, send frame to sendChan, let a error frame res be sent, and let send() initiate the cancel signal
 type WebSocket struct {
-	// support net.conn, and make the package easier to test
 	conn            net.Conn
 	ctx             context.Context
-	cancelFunc      context.CancelFunc
 	readChan        chan []byte
 	sendChan        chan iOutFrame
-	readSetupDone   atomic.Bool
-	sendSetupDone   atomic.Bool
-	readClosed      atomic.Bool
-	sendClosed      atomic.Bool
 	l               *slog.Logger
 	br              *bufio.Reader
 	bw              *bufio.Writer
 	allowedIdleTime time.Duration
 	pingInterval    time.Duration
+
+	// handle setup assertion
+	readSetupDone atomic.Bool
+	sendSetupDone atomic.Bool
+
+	// handle graceful closing
+	closeOnce sync.Once
+	err       error
+	doneChan  chan struct{}
 }
 
 func NewWebSocket(ctx context.Context, conn net.Conn, allowedIdleTime time.Duration, pingInterval time.Duration) *WebSocket {
-	ctxWCan, cancelFunc := context.WithCancel(ctx)
 	return &WebSocket{
-		ctx:             ctxWCan,
+		ctx:             ctx,
 		conn:            conn,
-		cancelFunc:      cancelFunc,
 		readChan:        make(chan []byte, 10),
 		sendChan:        make(chan iOutFrame, 10),
 		l:               logger.Get(ctx),
@@ -87,6 +100,8 @@ func NewWebSocket(ctx context.Context, conn net.Conn, allowedIdleTime time.Durat
 		bw:              bufio.NewWriter(conn),
 		allowedIdleTime: allowedIdleTime,
 		pingInterval:    pingInterval,
+
+		doneChan: make(chan struct{}),
 	}
 }
 
@@ -95,6 +110,7 @@ func (ws *WebSocket) Setup() {
 	assert.Assert(!ws.sendSetupDone.Load(), "Setup has been called before")
 	go ws.send()
 	go ws.read()
+	go ws.monitorCtx()
 
 	ws.conn.SetReadDeadline(time.Now().Add(ws.allowedIdleTime))
 	if ws.pingInterval > 0 {
@@ -108,32 +124,40 @@ func (ws *WebSocket) Setup() {
 func (ws *WebSocket) Read() ([]byte, error) {
 	assert.Assert(ws.readSetupDone.Load(), "WebSocket.Setup has not bee called, Read has not been setup")
 
-	if ws.readClosed.Load() {
-		return nil, errors.Join(WebSocketClosed, ws.ctx.Err())
-	}
 	select {
 	case bs := <-ws.readChan:
 		return bs, nil
-	case <-ws.ctx.Done():
-		return nil, errors.Join(WebSocketClosed, ws.ctx.Err())
+	case <-ws.doneChan:
+		return nil, ws.err
 	}
 }
 
 func (ws *WebSocket) Send(f iOutFrame) error {
 	assert.Assert(ws.sendSetupDone.Load(), "WebSocket.Setup has not bee called, send has not been setup")
 
-	if ws.sendClosed.Load() {
-		return WebSocketClosed
-	}
-
 	select {
 	case ws.sendChan <- f:
 		return nil
-	case <-ws.ctx.Done():
-		close(ws.sendChan)
-		ws.sendClosed.Store(true)
-		return errors.Join(WebSocketClosed, ws.ctx.Err())
+	case <-ws.doneChan:
+		return ws.err
 	}
+}
+
+func (ws *WebSocket) monitorCtx() {
+	select {
+	case <-ws.ctx.Done():
+		ws.l.Debug("WebSocket: Context got done")
+		ws.close(ws.ctx.Err())
+	case <-ws.doneChan:
+		break
+	}
+}
+
+func (ws *WebSocket) close(err error) {
+	ws.closeOnce.Do(func() {
+		ws.err = errors.Join(WebSocketClosed, err)
+		close(ws.doneChan)
+	})
 }
 
 func (ws *WebSocket) ping() {
@@ -141,18 +165,16 @@ func (ws *WebSocket) ping() {
 		OpCode: OP_CODE_PING,
 	}
 
-	for true {
-		if ws.sendClosed.Load() || ws.readClosed.Load() {
-			ws.l.Debug("Ping-er: send / read closed, returning", "sendClosed", ws.sendClosed.Load(), "readClosed", ws.readClosed.Load())
-			return
-		}
+	ticker := time.NewTicker(ws.pingInterval)
+	defer ticker.Stop()
 
+	for {
 		select {
-		case <-time.Tick(ws.pingInterval):
+		case <-ticker.C:
 			ws.l.Debug("Ping-er: PING PONG TIME")
 			ws.Send(pingFrame)
-		case <-ws.ctx.Done():
-			ws.l.Debug("Ping-er: context done")
+		case <-ws.doneChan:
+			ws.l.Debug("Ping-er: Done chan said enough PING PONG, retuning...")
 			return
 		}
 	}
@@ -163,30 +185,25 @@ func (ws *WebSocket) read() {
 
 	fragmentations := make([]byte, 0)
 	var rootFrame *inFrame
+	var closeErr error
+	defer ws.close(closeErr)
 
 Outer:
-	for true {
+	for {
 		ws.l.Debug("Frame Reader: in loop")
 		f, err := ws.readFrame()
 		if err != nil {
+			closeErr = err
+
 			var fe *frameErr
 			if errors.As(err, &fe) {
 				ws.l.Error("Frame Reader: protocol error found during frame reading", "err", err)
-				ws.Send(&outFrame{
-					OpCode:  OP_CODE_CLOSE,
+				ws.Send(&closeFrame{
 					Payload: fe.ToPayload(),
 				})
 				break
 			}
-			if errors.Is(err, WebSocketClosed) {
-				ws.l.Error("Frame Reader: web socket closed during frame reading", "err", err)
-				break
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				ws.l.Error("Frame Reader: read deadline exceeded", "err", err)
-				break
-			}
-			ws.l.Error("Frame Reader: unknown and unhandled error, failing fast and closing connection", "err", err)
+			ws.l.Error("Frame Reader: Error when reading frame, closing the socket", "err", err)
 			break
 		}
 
@@ -195,9 +212,10 @@ Outer:
 				Message:   fmt.Sprintf("Unexpected non continuation frame when a fragmented frame is expected, opCode provided: %s", logger.GetPPByteStr(f.OpCode)),
 				CloseCode: CLOSE_CODE_PROTOCOL_VIOLATION,
 			}
+			closeErr = fe
+
 			ws.l.Error("Frame Reader: error while processing frame", "err", fe)
-			ws.Send(&outFrame{
-				OpCode:  OP_CODE_CLOSE,
+			ws.Send(&closeFrame{
 				Payload: fe.ToPayload(),
 			})
 			break
@@ -205,9 +223,7 @@ Outer:
 
 		if f.OpCode == OP_CODE_CLOSE {
 			ws.l.Debug("Frame Reader: client want to close, we will do so")
-			ws.Send(&outFrame{
-				OpCode: OP_CODE_CLOSE,
-			})
+			ws.Send(&closeFrame{})
 			break
 		}
 
@@ -231,9 +247,9 @@ Outer:
 				CloseCode: CLOSE_CODE_PROTOCOL_VIOLATION,
 			}
 			ws.l.Error("Frame Reader: error while processing frame", "err", fe)
+			closeErr = fe
 
-			ws.Send(&outFrame{
-				OpCode:  OP_CODE_CLOSE,
+			ws.Send(&closeFrame{
 				Payload: fe.ToPayload(),
 			})
 			break
@@ -248,8 +264,9 @@ Outer:
 				}
 				ws.l.Error("Frame Reader: error while processing frame", "err", fe)
 
-				ws.Send(&outFrame{
-					OpCode:  OP_CODE_CLOSE,
+				closeErr = fe
+
+				ws.Send(&closeFrame{
 					Payload: fe.ToPayload(),
 				})
 				break
@@ -271,14 +288,11 @@ Outer:
 		case ws.readChan <- finalPayload:
 			rootFrame = nil
 			fragmentations = make([]byte, 0)
-		case <-ws.ctx.Done():
+		case <-ws.doneChan:
+			ws.l.Debug("Frame Reader: socket is closed, returning")
 			break Outer
 		}
 	}
-
-	ws.cancelFunc()
-	close(ws.readChan)
-	ws.readClosed.Store(true)
 }
 
 func (ws *WebSocket) readFrame() (*inFrame, error) {
@@ -462,20 +476,25 @@ func (ws *WebSocket) readFrame() (*inFrame, error) {
 
 func (ws *WebSocket) send() {
 	assert.AssertNotNil(ws.bw, "Buffer writer is nil, cannot proceed with send")
-
 	ws.l.Debug("Frame Sender: waiting patiently for send event")
 
+	var closeErr error
+	defer ws.close(closeErr)
+	defer ws.conn.Close()
+
 Outer:
-	for true {
+	for {
 		var f iOutFrame
 		select {
 		case f = <-ws.sendChan:
 			if f == nil {
 				ws.l.Debug("Frame Sender: Unexpected nil / channel closed, breaking")
+
+				closeErr = errors.New("Frame Sender: Unexpected nil / channel closed, breaking")
 				break Outer
 			}
-		case <-ws.ctx.Done():
-			ws.l.Debug("Frame Sender: Context done, breaking")
+		case <-ws.doneChan:
+			ws.l.Debug("Frame Sender: Done chan said no more sending, breaking")
 			break Outer
 		}
 		payload, opCode := f.GetPayload(), f.GetOpCode()
@@ -485,7 +504,7 @@ Outer:
 		start, end := 0, min(MAX_PAYLOAD_SIZE, payloadSize-1)+1
 		inFrag := payloadSize > end
 
-		for true {
+		for {
 			ws.l.Debug(fmt.Sprintf("Frame Sender: sending frame, is this frame fragmented? %t", inFrag), "start", start, "end", end, "payloadSize", payloadSize)
 			frameBytes := make([]byte, 0, 10)
 			var hdr1 byte
@@ -529,15 +548,19 @@ Outer:
 			err := ws.conn.SetWriteDeadline(time.Now().Add(ws.allowedIdleTime))
 			if err != nil {
 				ws.l.Error(fmt.Sprintf("Unexpected error when setting write deadline: %s, breaking", err.Error()))
+
+				closeErr = err
 				break Outer
 			}
 			i, err := ws.bw.Write(frameBytes)
 			if err != nil {
 				ws.l.Error(fmt.Sprintf("Unexpected error when writing res frame: %s, breaking", err.Error()))
+				closeErr = err
 				break Outer
 			}
 			if i != len(frameBytes) {
 				ws.l.Error("Frame is not fully written due to unexpected reasons, breaking", "i", i, "frameLen", len(frameBytes))
+				closeErr = errors.New("Frame is not fully written due to unexpected reasons")
 				break Outer
 
 			}
@@ -545,6 +568,7 @@ Outer:
 			err = ws.bw.Flush()
 			if err != nil {
 				ws.l.Error(fmt.Sprintf("Unexpected error when flushing bufio writer: %s, breaking", err.Error()))
+				closeErr = err
 				break Outer
 			}
 
@@ -558,7 +582,11 @@ Outer:
 			start, end = end, min(end+MAX_PAYLOAD_SIZE, payloadSize-1)+1
 			inFrag = payloadSize > end
 		}
-	}
 
-	ws.cancelFunc()
+		_, ok := f.(closeFrame)
+		if ok {
+			ws.l.Debug("Frame Sender: close frame sent, breaking")
+			break
+		}
+	}
 }

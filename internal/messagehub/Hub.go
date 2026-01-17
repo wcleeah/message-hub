@@ -45,7 +45,7 @@ func (mh *MessageHub) Start() error {
 }
 
 func (mh *MessageHub) registerClient() {
-	for true {
+	for {
 		client := <-mh.regChan
 		_, ok := mh.clients[client.Id]
 
@@ -58,7 +58,7 @@ func (mh *MessageHub) registerClient() {
 }
 
 func (mh *MessageHub) unregisterClient() {
-	for true {
+	for {
 		id := <-mh.unregChan
 		_, ok := mh.clients[id]
 		assert.Assert(ok, "Client is never registered")
@@ -72,7 +72,7 @@ func (mh *MessageHub) handleEvent(c *Client) {
 	ws := websocket.NewWebSocket(c.Ctx, c.Conn, 30*time.Second, mh.livelinessCheckInterval)
 	ws.Setup()
 
-	for true {
+	for {
 		bs, err := ws.Read()
 		if err != nil {
 			l.Error("Event handler: Error during reading from ws, breaking", "err", err)
@@ -89,8 +89,6 @@ func (mh *MessageHub) handleEvent(c *Client) {
 			break
 		}
 	}
-
-	c.Conn.Close()
 
 	// unreg
 	mh.unregChan <- c.Id
