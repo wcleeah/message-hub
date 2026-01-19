@@ -6,5 +6,8 @@ dev:
 test-all:
     go test ./... -v
 
-btx bin:
+fb:
+	go run cmd/util/framebinary.go
+
+btxb bin:
 	printf '%02X\n' "$((2#{{bin}}))"
