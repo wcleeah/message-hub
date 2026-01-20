@@ -103,6 +103,62 @@ func TestFrame(t *testing.T) {
 	}
 }
 
+func TestTextFrame(t *testing.T) {
+	testCases := make([]*goldenTestCase, 0)
+	testCases = append(testCases, validTextFrame()...)
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			assert := assert.New(t)
+			client, server := net.Pipe()
+			client.SetReadDeadline(time.Now().Add(tc.ReadDeadline))
+
+			br := bufio.NewReader(client)
+			bw := bufio.NewWriter(client)
+
+			ws := websocket.NewWebSocket(context.Background(), server, tc.ReadDeadline, 0*time.Second)
+			ws.Setup()
+
+			for _, sfLoc := range tc.SendFrameLocs {
+				sendFrame := readTestData(t, sfLoc)
+
+				i, err := bw.Write(sendFrame)
+				assert.Nil(err, "Unexpected error when writing to connection")
+				assert.Equal(len(sendFrame), i)
+				err = bw.Flush()
+				assert.Nil(err, "Unexpected error when flushing buf writer")
+			}
+
+			bs, err := ws.Read()
+			assert.NoError(err, "Read from websocket should not have error")
+			ws.Send(websocket.TextFrame{
+				Payload: bs,
+			})
+
+			for _, rfLoc := range tc.ResFrameLocs {
+				resFrame := readTestData(t, rfLoc)
+				resBytes := make([]byte, len(resFrame))
+
+				i, err := io.ReadFull(br, resBytes)
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Errorf("Deadline line exceeded, expected %d bytes, read %d bytes, read bytes are: %s", len(resBytes), i, logger.GetPPBytesStr(resBytes[:i]))
+
+					return
+				}
+				assert.Nilf(err, "Deadline line exceeded, expected %d bytes, read %d bytes, read bytes are: %s", len(resBytes), i, logger.GetPPBytesStr(resBytes[:i]))
+				assert.Equal(len(resBytes), i, "Bytes read is different from expected")
+
+				if diff := cmp.Diff(resFrame, resBytes); diff != "" {
+					t.Errorf("Response mismatch (-want +got):\n%s", diff)
+				}
+			}
+
+			client.Close()
+			server.Close()
+		})
+	}
+}
+
 func validAutoFrame() []*goldenTestCase {
 	return []*goldenTestCase{
 		{
@@ -223,6 +279,29 @@ func invalidAutoFrame() []*goldenTestCase {
 			SendFrameLocs: []string{"nomask_close_sendframe.golden"},
 			ResFrameLocs:  []string{"nomask_resframe.golden"},
 			ReadDeadline:  5 * time.Second,
+		},
+	}
+}
+
+func validTextFrame() []*goldenTestCase {
+	return []*goldenTestCase{
+		{
+			Name:          "No frag",
+			SendFrameLocs: []string{"nofrag_sendframe.golden"},
+			ResFrameLocs:  []string{"nofrag_resframe.golden"},
+			ReadDeadline:  5 * time.Second,
+		},
+		{
+			Name:          "Frag Req No Frag Res",
+			SendFrameLocs: []string{"fragsend_1_sendframe.golden", "fragsend_2_sendframe.golden", "fragsend_end_sendframe.golden"},
+			ResFrameLocs:  []string{"fragsend_resframe.golden"},
+			ReadDeadline:  5 * time.Second,
+		},
+		{
+			Name:          "Frag Req Frag Res",
+			SendFrameLocs: []string{"fragreqres_1_sendframe.golden", "fragreqres_2_sendframe.golden", "fragreqres_end_sendframe.golden"},
+			ResFrameLocs:  []string{"fragreqres_1_resframe.golden", "fragreqres_2_resframe.golden"},
+			ReadDeadline:  20 * time.Second,
 		},
 	}
 }

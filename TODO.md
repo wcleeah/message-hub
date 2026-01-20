@@ -16,11 +16,11 @@
   - [ ] conn close during send
   - [ ] read deadline exceeds
   - [ ] write deadline exceeds
-- [ ] protocol violation
+- [x] protocol violation
 - [ ] Setup
 - [ ] Auto ping pong
-- [ ] Text frame / frag frame read
-- [ ] Text frame / frag frame read 
+- [x] Text frame / frag frame read
+- [x] Text frame / frag frame read 
 
 ## The event handling part
 - [ ] construct the websocket protocol, with type and action
