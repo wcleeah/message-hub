@@ -501,7 +501,7 @@ Outer:
 		ws.l.Debug("Frame Sender: got something", "opCode", opCode, "payload", string(payload))
 
 		payloadSize := len(payload)
-		start, end := 0, min(MAX_PAYLOAD_SIZE, payloadSize-1)+1
+		start, end := 0, min(MAX_PAYLOAD_SIZE, payloadSize)
 		inFrag := payloadSize > end
 
 		for {
@@ -546,6 +546,7 @@ Outer:
 			ws.l.Debug("Frame Sender: sending the frame")
 
 			err := ws.conn.SetWriteDeadline(time.Now().Add(ws.allowedIdleTime))
+			ws.l.Debug("Frame Sender: deadline set")
 			if err != nil {
 				ws.l.Error(fmt.Sprintf("Unexpected error when setting write deadline: %s, breaking", err.Error()))
 
@@ -553,6 +554,7 @@ Outer:
 				break Outer
 			}
 			i, err := ws.bw.Write(frameBytes)
+			ws.l.Debug("Frame Sender: bytes written")
 			if err != nil {
 				ws.l.Error(fmt.Sprintf("Unexpected error when writing res frame: %s, breaking", err.Error()))
 				closeErr = err
@@ -566,6 +568,7 @@ Outer:
 			}
 
 			err = ws.bw.Flush()
+			ws.l.Debug("Frame Sender: bytes flushed")
 			if err != nil {
 				ws.l.Error(fmt.Sprintf("Unexpected error when flushing bufio writer: %s, breaking", err.Error()))
 				closeErr = err
@@ -579,7 +582,7 @@ Outer:
 			}
 			ws.l.Debug("Frame Sender: fragmented, setting up next frame")
 
-			start, end = end, min(end+MAX_PAYLOAD_SIZE, payloadSize-1)+1
+			start, end = end, min(end+MAX_PAYLOAD_SIZE, payloadSize)
 			inFrag = payloadSize > end
 		}
 
