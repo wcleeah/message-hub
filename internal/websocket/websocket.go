@@ -338,7 +338,7 @@ func (ws *WebSocket) readFrame() (*inFrame, error) {
 
 	// opCode: opCode code
 	opCode := (hdr1 & 0x0F)
-	if (opCode == 0x8 || opCode == 0x9 || opCode == 0xA) && !fin {
+	if (opCode == OP_CODE_CLOSE || opCode == OP_CODE_PING || opCode == OP_CODE_PONG) && !fin {
 		return nil, &frameErr{
 			Message:   "Control frame cannot be fragmented",
 			CloseCode: CLOSE_CODE_PROTOCOL_VIOLATION,
