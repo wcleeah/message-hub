@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"com.lwc.message_center_server/internal/assert"
 	"com.lwc.message_center_server/internal/logger"
@@ -184,9 +185,9 @@ func (ws *WebSocket) read() {
 	assert.AssertNotNil(ws.br, "Buffer Reader is nil, cannot proceed reading")
 
 	fragmentations := make([]byte, 0)
+	numberOfFrag := 0
 	var rootFrame *inFrame
 	var closeErr error
-	defer ws.close(closeErr)
 
 Outer:
 	for {
@@ -204,20 +205,6 @@ Outer:
 				break
 			}
 			ws.l.Error("Frame Reader: Error when reading frame, closing the socket", "err", err)
-			break
-		}
-
-		if rootFrame != nil && f.OpCode != OP_CODE_CONTINUATION {
-			fe := &frameErr{
-				Message:   fmt.Sprintf("Unexpected non continuation frame when a fragmented frame is expected, opCode provided: %s", logger.GetPPByteStr(f.OpCode)),
-				CloseCode: CLOSE_CODE_PROTOCOL_VIOLATION,
-			}
-			closeErr = fe
-
-			ws.l.Error("Frame Reader: error while processing frame", "err", fe)
-			ws.Send(&closeFrame{
-				Payload: fe.ToPayload(),
-			})
 			break
 		}
 
@@ -246,53 +233,118 @@ Outer:
 				Message:   "Binary format payload is not supported",
 				CloseCode: CLOSE_CODE_PROTOCOL_VIOLATION,
 			}
-			ws.l.Error("Frame Reader: error while processing frame", "err", fe)
-			closeErr = fe
 
+			closeErr = fe
 			ws.Send(&closeFrame{
 				Payload: fe.ToPayload(),
 			})
 			break
 		}
 
-		if !f.Fin {
-			ws.l.Debug("Frame Reader: Fragmented frame detected")
-			if rootFrame == nil && f.OpCode != OP_CODE_TEXT {
+		if rootFrame != nil {
+			if f.OpCode != OP_CODE_CONTINUATION {
 				fe := &frameErr{
-					Message:   fmt.Sprintf("First Fragmented frame detected, but opCode is not binary or text, opCode provided: %s", logger.GetPPByteStr(f.OpCode)),
+					Message:   "Unexpected non continuation frame when a fragmented frame is expected",
 					CloseCode: CLOSE_CODE_PROTOCOL_VIOLATION,
 				}
-				ws.l.Error("Frame Reader: error while processing frame", "err", fe)
 
 				closeErr = fe
-
 				ws.Send(&closeFrame{
 					Payload: fe.ToPayload(),
 				})
 				break
 			}
-			if rootFrame == nil {
-				ws.l.Debug("Frame Reader: this is the first fragmented frame", "opCode", f.OpCode)
-				rootFrame = f
+		} else {
+			if f.OpCode != OP_CODE_TEXT {
+				fe := &frameErr{
+					Message:   "First Fragmented frame detected, but opCode is not text",
+					CloseCode: CLOSE_CODE_PROTOCOL_VIOLATION,
+				}
+
+				closeErr = fe
+				ws.Send(&closeFrame{
+					Payload: fe.ToPayload(),
+				})
+				break
+			}
+			ws.l.Debug("Frame Reader: this is the first fragmented frame", "opCode", f.OpCode)
+			rootFrame = f
+		}
+
+		if len(f.Payload) > MAX_PAYLOAD_SIZE_PER_FRAME {
+			fe := &frameErr{
+				Message:   "Payload size limit exceeded",
+				CloseCode: CLOSE_CODE_PAYLOAD_TOO_BIG,
 			}
 
-			ws.l.Debug("Frame Reader: payload of this fragmented frame", "payload", string(f.Payload))
-			fragmentations = append(fragmentations, f.Payload...)
+			closeErr = fe
+			ws.Send(&closeFrame{
+				Payload: fe.ToPayload(),
+			})
+			break
+		}
+
+		fragmentations = append(fragmentations, f.Payload...)
+		numberOfFrag++
+
+		if len(fragmentations) > MAX_PAYLOAD_SIZE_TOTAL {
+			fe := &frameErr{
+				Message:   "Total payload size limit exceeded",
+				CloseCode: CLOSE_CODE_PAYLOAD_TOO_BIG,
+			}
+
+			closeErr = fe
+			ws.Send(&closeFrame{
+				Payload: fe.ToPayload(),
+			})
+			break
+		}
+
+		if numberOfFrag > MAX_NUMBER_OF_FRAG {
+			fe := &frameErr{
+				Message:   "Too many fragmentations frame has been sent",
+				CloseCode: CLOSE_CODE_PAYLOAD_TOO_BIG,
+			}
+
+			closeErr = fe
+			ws.Send(&closeFrame{
+				Payload: fe.ToPayload(),
+			})
+			break
+		}
+
+		ws.l.Debug("Frame Reader: payload of this fragmented frame", "payload", string(f.Payload))
+		if !f.Fin {
 			continue
 		}
 
-		finalPayload := append(fragmentations, f.Payload...)
-		ws.l.Debug("Frame Reader: all fragmented frame arrived, echoing back to client", "allPayload", string(finalPayload))
+		ws.l.Debug("Frame Reader: all fragmented frame arrived, echoing back to client", "allPayload", string(fragmentations))
+		if !utf8.Valid(fragmentations) {
+			fe := &frameErr{
+				Message:   "Only utf8 text is allowed",
+				CloseCode: CLOSE_CODE_INVALID_PAYLOAD,
+			}
+
+			closeErr = fe
+			ws.Send(&closeFrame{
+				Payload: fe.ToPayload(),
+			})
+			break
+		}
 
 		select {
-		case ws.readChan <- finalPayload:
+		case ws.readChan <- fragmentations:
 			rootFrame = nil
 			fragmentations = make([]byte, 0)
+			numberOfFrag = 0
 		case <-ws.doneChan:
 			ws.l.Debug("Frame Reader: socket is closed, returning")
 			break Outer
 		}
 	}
+
+	ws.l.Error("Frame Reader: error while processing frame", "err", closeErr)
+	ws.close(closeErr)
 }
 
 func (ws *WebSocket) readFrame() (*inFrame, error) {
@@ -417,13 +469,6 @@ func (ws *WebSocket) readFrame() (*inFrame, error) {
 
 	ws.l.Debug(fmt.Sprintf("Frame Reader: Final plen: %d", plen))
 
-	if plen > MAX_PAYLOAD_SIZE {
-		return nil, &frameErr{
-			Message:   "Payload size limit exceeded",
-			CloseCode: CLOSE_CODE_PAYLOAD_TOO_BIG,
-		}
-	}
-
 	var maskKey [4]byte
 	i, err = io.ReadFull(ws.br, maskKey[:])
 	if err != nil {
@@ -501,7 +546,7 @@ Outer:
 		ws.l.Debug("Frame Sender: got something", "opCode", opCode, "payload", string(payload))
 
 		payloadSize := len(payload)
-		start, end := 0, min(MAX_PAYLOAD_SIZE, payloadSize)
+		start, end := 0, min(MAX_PAYLOAD_SIZE_PER_FRAME, payloadSize)
 		inFrag := payloadSize > end
 
 		for {
@@ -582,7 +627,7 @@ Outer:
 			}
 			ws.l.Debug("Frame Sender: fragmented, setting up next frame")
 
-			start, end = end, min(end+MAX_PAYLOAD_SIZE, payloadSize)
+			start, end = end, min(end+MAX_PAYLOAD_SIZE_PER_FRAME, payloadSize)
 			inFrag = payloadSize > end
 		}
 
