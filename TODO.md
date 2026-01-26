@@ -21,6 +21,8 @@
 - [ ] Auto ping pong
 - [x] Text frame / frag frame read
 - [x] Text frame / frag frame read 
+- [o] Invalid TextFrame
+  - [ ] non utf8 payload
 
 ## The event handling part
 - [ ] construct the websocket protocol, with type and action
